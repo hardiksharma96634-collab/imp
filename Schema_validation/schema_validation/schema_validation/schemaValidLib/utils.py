@@ -46,10 +46,16 @@ class Utils(Common_Utils):
     """
     Get the list of product family names from widget selection
     """
-    productFamilyNames = self.widget.getPlatformFamily()
-    if isinstance(productFamilyNames, str):
-      productFamilyNames = [productFamily.strip() for productFamily in productFamilyNames.split(",")]
-    return productFamilyNames
+    try:
+      productFamilyNames = self.widget.getPlatformFamily()
+      if productFamilyNames is None:
+        return []
+      if isinstance(productFamilyNames, str):
+        productFamilyNames = [productFamily.strip() for productFamily in productFamilyNames.split(",") if productFamily.strip()]
+      return productFamilyNames if productFamilyNames else []
+    except Exception as e:
+      print(f"Error getting product family names: {e}")
+      return []
 
   """
   Enhanced function returns the final report for the events having schema validations
@@ -66,6 +72,10 @@ class Utils(Common_Utils):
     # self.widget.getErrorMessage()
     self.payloads.clear() #clearing payloads dict
     self.schemaReport.clear() #clearing payloads dict
+
+    # Ensure products list is initialized
+    if not hasattr(self, 'products') or self.products is None:
+      self.products = self.get_requiredProductFamilyNames()
     self.filter_productFamilies = self.products
     print(f"In {self.widget.getStackType()}: ")
     print(f"For Error {self.schemaError}:\n")
@@ -104,7 +114,11 @@ class Utils(Common_Utils):
           else:
             error_conditions.append(col(error_col).rlike(self.schemaError))
 
-        # Combine all error conditions with OR
+        # Combine all error conditions with OR - with safety check
+        if len(error_conditions) == 0:
+          print(f"Warning: No error conditions defined for {productFamily}")
+          continue
+
         combined_error_condition = error_conditions[0]
         for condition in error_conditions[1:]:
           combined_error_condition = combined_error_condition | condition
@@ -114,7 +128,19 @@ class Utils(Common_Utils):
         self.print_reproducibilty_schemaValidationIssue(errorCount=schemaErrorEvents,totalCount=productTotalEvents,product=productFamily)
 
         if(schemaErrorEvents>0):
-          json_schema = productSchemaErrorDf.select(schema_of_json(col("rawJson")).alias("json_schema")).collect()[-1]['json_schema']
+          # Safe JSON schema extraction with error handling
+          try:
+            json_schema_result = productSchemaErrorDf.select(schema_of_json(col("rawJson")).alias("json_schema")).collect()
+            if len(json_schema_result) == 0:
+              print(f"Warning: No JSON schema found for {productFamily}, skipping...")
+              continue
+            json_schema = json_schema_result[-1]['json_schema']
+            if json_schema is None:
+              print(f"Warning: JSON schema is None for {productFamily}, skipping...")
+              continue
+          except Exception as e:
+            print(f"Error extracting JSON schema for {productFamily}: {e}")
+            continue
           productDf=productDf.withColumn('ParsedRawJson',from_json(col('rawJson'),json_schema))
           productSchemaErrorDf = productDf.filter(combined_error_condition)
 

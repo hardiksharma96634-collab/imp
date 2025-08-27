@@ -130,7 +130,11 @@ class Common_Utils(Spark):
     return df_modified
 
   def add_fwVerLineCol(self,df,sample_fw_formate = None):
-    fwVerPath = self.find_column_paths(df,"firmwareVersion")[0]
+    fw_paths = self.find_column_paths(df,"firmwareVersion")
+    if len(fw_paths) == 0:
+      print("Warning: No firmwareVersion column found, skipping firmware version line addition")
+      return df
+    fwVerPath = fw_paths[0]
     if (sample_fw_formate is not None) and (fnmatch.fnmatch(sample_fw_formate,"*.*.00")):
       df_modified = df.withColumn("fwVerLine",col(fwVerPath).substr(-12,8))
     else:
@@ -158,8 +162,16 @@ class Common_Utils(Spark):
     return newDf
 
   def get_sampleFw(self,df):
-    fwVer =df.filter(col("originator.originatorDetail.firmwareVersion").isNotNull()).select("originator.originatorDetail.firmwareVersion").first()[0]
-    return fwVer
+    try:
+      fw_result = df.filter(col("originator.originatorDetail.firmwareVersion").isNotNull()).select("originator.originatorDetail.firmwareVersion").first()
+      if fw_result is None:
+        print("Warning: No firmware version found in data")
+        return None
+      fwVer = fw_result[0]
+      return fwVer
+    except Exception as e:
+      print(f"Error getting sample firmware version: {e}")
+      return None
 
   def getCDMpath(self,originator,event,env):
     try:
@@ -299,7 +311,11 @@ class Common_Utils(Spark):
                     select distinct(catalog_component) from team_enterprise_prod.ref_enrich.platform_gun_mappings
                     where originator_gun like '{originator_path}' and gun_name like '{event_path}'
                     """)
-      unity_catalog_component = df.collect()[0][0]
+      catalog_result = df.collect()
+      if len(catalog_result) == 0:
+        print("Error: No catalog component found for the given originator and event combination")
+        return None
+      unity_catalog_component = catalog_result[0][0]
       unity_catalog_table_path = "team_onecloud"+env+"."+"cdm_bronze."+unity_catalog_component
       # unity_catalog_df = Spark.spark.sql(f"select * from '{unity_catalog_table_path}' where receive_date >= '{startDate}' and receive_date <='{endDate}'")
 

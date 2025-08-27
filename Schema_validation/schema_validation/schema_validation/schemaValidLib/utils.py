@@ -35,19 +35,29 @@ class Utils(Common_Utils):
   """
   def get_extractData(self, df, otherColumns=None):
     df = self.segrate_productNumber(df)
-    df = self.add_fwVerLineCol(df,self.get_sampleFw(df)) 
+    df = self.add_fwVerLineCol(df,self.get_sampleFw(df))
 
     if otherColumns is not None:
       self.common_columns.extend(cols for cols in otherColumns)
     df = self.combine_ref(df.select(self.common_columns))
     return df
 
+  def get_requiredProductFamilyNames(self):
+    """
+    Get the list of product family names from widget selection
+    """
+    productFamilyNames = self.widget.getPlatformFamily()
+    if isinstance(productFamilyNames, str):
+      productFamilyNames = [productFamily.strip() for productFamily in productFamilyNames.split(",")]
+    return productFamilyNames
+
   """
-  this function returns the final report for the events having schema validations
+  Enhanced function returns the final report for the events having schema validations
+  Now supports all three error types: eventDetailError, originatorDetailError, shadowEventNotificationError
   param-1: df-> dataframe having all events for the req. originator and event gun with defined stack env for a defined timeperiod
   param-2: env-> name of stack--> used only to denote in output, for which stack the report is generated.
   param-3: productFamilies(optional)-> list of all products for what you want require report; ex-["NOVELLI","VASARI"]
-  param-4: schemaError(optional)-> sample error message 
+  param-4: schemaError(optional)-> sample error message
   param-5: otherColumns(optional)-> columns need to be include in final report
   param-6: filterExp(optional)-> query that need to be filtered from records for exactly required report, ex: filter by firmwareverion---> filterExp=(col("firmwareVersion").rlike("6.17.3.115")))
   """
@@ -59,18 +69,21 @@ class Utils(Common_Utils):
     self.filter_productFamilies = self.products
     print(f"In {self.widget.getStackType()}: ")
     print(f"For Error {self.schemaError}:\n")
-    
+
     if((self.is_allPlatormFamilies)|(self.filter_productFamilies==[''])):
-      self.providePayload=False                  
+      self.providePayload=False
 
     if filterExp is not None:
       df = df.filter(filterExp)
+
+    # Define error columns to check - Enhanced to support all three error types
+    error_columns = ["eventDetailError", "originatorDetailError", "shadowEventNotificationError"]
 
     '''ToDo: need to handle a case when platform family is not selected in widget'''
     # if filter_productFamilies is None:
     #   filter_productFamilies = df.select("platform_family").distinct().collect()[0]
     #     # display(df.select("platform_family").distinct())
-    
+
     for productFamily in self.filter_productFamilies:
       productDf = df.filter(col("platform_family").rlike(productFamily))
       productTotalEvents = productDf.count()
@@ -79,41 +92,62 @@ class Utils(Common_Utils):
         print(f"no data found for {productFamily} for {filterExp}\n")
         continue
       else:
-        if self.schemaError == "":
-          productSchemaErrorDf = productDf.filter(col("eventDetailError").isNotNull())
-        else:
-          productSchemaErrorDf = productDf.filter(col("eventDetailError").rlike(self.schemaError))
+        # Show error breakdown for this product family
+        print(f"\n--- Error Breakdown for {productFamily} ---")
+        self.get_error_breakdown(productDf)
+
+        # Check for errors in all three error columns
+        error_conditions = []
+        for error_col in error_columns:
+          if self.schemaError == "":
+            error_conditions.append(col(error_col).isNotNull())
+          else:
+            error_conditions.append(col(error_col).rlike(self.schemaError))
+
+        # Combine all error conditions with OR
+        combined_error_condition = error_conditions[0]
+        for condition in error_conditions[1:]:
+          combined_error_condition = combined_error_condition | condition
+
+        productSchemaErrorDf = productDf.filter(combined_error_condition)
         schemaErrorEvents = productSchemaErrorDf.count()
         self.print_reproducibilty_schemaValidationIssue(errorCount=schemaErrorEvents,totalCount=productTotalEvents,product=productFamily)
+
         if(schemaErrorEvents>0):
           json_schema = productSchemaErrorDf.select(schema_of_json(col("rawJson")).alias("json_schema")).collect()[-1]['json_schema']
           productDf=productDf.withColumn('ParsedRawJson',from_json(col('rawJson'),json_schema))
-          productSchemaErrorDf  = productDf.filter(col("eventDetailError").rlike(self.schemaError))
+          productSchemaErrorDf = productDf.filter(combined_error_condition)
+
           if(len(self.find_column_paths(productDf,"notificationTrigger"))!=0 and "Missing field 'version'" not in self.schemaError):
             productDf=productDf.withColumn('notificationTrigger',coalesce(productDf.event.eventDetail.notificationTrigger,productDf.ParsedRawJson.event.eventDetail.notificationTrigger))
           reportCols = self.get_columnReqInSchemaValidnReport(productDf)
-      
+
           totalEventsDf = productDf.groupBy(reportCols).count().withColumnRenamed("count","totalEvents").withColumnRenamed("firmwareVersion","fw").withColumnRenamed("platform_family","product")
 
           if "notificationTrigger" in totalEventsDf.columns:
             totalEventsDf = totalEventsDf.withColumnRenamed("notificationTrigger","triggerType")
-          schemaErrorEventsDf = productDf.filter(col("eventDetailError").rlike(self.schemaError)).groupBy(reportCols).count().withColumnRenamed("count","schemaErrorEvents")
+
+          # Use the same combined error condition for schema error events
+          schemaErrorEventsDf = productDf.filter(combined_error_condition).groupBy(reportCols).count().withColumnRenamed("count","schemaErrorEvents")
+
           if joinType is None:
             joinType = "left"
 
           joinType_conditions = (schemaErrorEventsDf["firmwareVersion"]==totalEventsDf["fw"])&(schemaErrorEventsDf["platform_family"]==totalEventsDf["product"])
           if "notificationTrigger" in schemaErrorEventsDf.columns:
-            joinType_conditions = joinType_conditions & (schemaErrorEventsDf["notificationTrigger"]==totalEventsDf["triggerType"]) 
+            joinType_conditions = joinType_conditions & (schemaErrorEventsDf["notificationTrigger"]==totalEventsDf["triggerType"])
           schemaReportDf = schemaErrorEventsDf.join(totalEventsDf,joinType_conditions,joinType).withColumn("schemaError%",format_number(((col("schemaErrorEvents")/col("totalEvents"))*100),2)).drop("fw","product")
           if  "notificationTrigger" in schemaErrorEventsDf.columns:
             schemaReportDf = schemaReportDf.drop("triggerType")
 
           # store all reports df into a dict: key-> platform_family_name, value->report_df_filtered_for_respected_platform_family
           self.schemaReport[productFamily]=schemaReportDf
-          
+
           # store all payloads df into a dict
           if (schemaErrorEvents>0) and (self.providePayload is True):
-            errorFree_df=productDf.filter(col("eventDetailError").isNull())
+            # Create error-free condition (all error columns are null)
+            error_free_condition = col("eventDetailError").isNull() & col("originatorDetailError").isNull() & col("shadowEventNotificationError").isNull()
+            errorFree_df=productDf.filter(error_free_condition)
             self.payloads[productFamily] = self.getSameDeviceExpectedPayload(productSchemaErrorDf,errorFree_df)
     return
 
@@ -191,3 +225,25 @@ class Utils(Common_Utils):
       for product, report in self.schemaReport.items():
         print(f"Schema Validation Report for {product}")
         display_function(report)
+
+  def get_error_breakdown(self, df):
+    """
+    Get detailed breakdown of errors by error type
+    Shows count and percentage for each of the three error types
+    """
+    error_columns = ["eventDetailError", "originatorDetailError", "shadowEventNotificationError"]
+    error_names = ["Event Detail Error", "Originator Detail Error", "Shadow Event Notification Error"]
+
+    print("=== ERROR BREAKDOWN BY TYPE ===")
+    total_count = df.count()
+
+    for i, error_col in enumerate(error_columns):
+      if self.schemaError == "":
+        error_count = df.filter(col(error_col).isNotNull()).count()
+      else:
+        error_count = df.filter(col(error_col).rlike(self.schemaError)).count()
+
+      percentage = (error_count / total_count * 100) if total_count > 0 else 0
+      print(f"{error_names[i]}: {error_count}/{total_count} ({percentage:.2f}%)")
+
+    print("=" * 35)
